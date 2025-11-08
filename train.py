@@ -1,37 +1,56 @@
 import jax
 import jax.numpy as jnp
 import optax
-from flax import nnx
+from flax.training import train_state
+from data import create_data_loader, evaluate
 
-def train(model, train_loader, val_loader, epochs=10, print_interval=1):
-    optimizer = optax.adam(learning_rate=1e-3)
-    params = model.init(jax.random.PRNGKey(0))['params']
-    opt_state = optimizer.init(params)
+def create_train_state(rng, model, learning_rate):
+    # 初始化模型时，rngs 作为第一个参数，包含 params 和 dropout 所需的随机数
+    params = model.init({'params': rng, 'dropout': rng}, jnp.ones((1, 32, 32, 3)))['params']
+    tx = optax.adam(learning_rate)
+    return train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx
+    )
+
+def train_step(state, batch, dropout_rng):
+    x, y = zip(*batch)
+    x = jnp.array(x)
+    y = jnp.array(y)
+    
+    def loss_fn(params):
+        rngs = {'dropout': dropout_rng}  # 传递 dropout 所需的随机数
+        logits = state.apply_fn({'params': params}, x, rngs=rngs)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+        return loss
+    
+    grad_fn = jax.value_and_grad(loss_fn)
+    loss, grads = grad_fn(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, loss
+
+def train(model, train_data, val_data, batch_size, epochs, print_interval):
+    rng = jax.random.PRNGKey(0)
+    state = create_train_state(rng, model, learning_rate=0.001)
     
     for epoch in range(epochs):
-        train_loss = 0.0
-        for x, y in train_loader:
-            def loss_fn(p):
-                model.update(p)
-                logits = model(x)
-                return jnp.mean(optax.softmax_cross_entropy(logits, jax.nn.one_hot(y, 10)))
-            
-            loss, grads = jax.value_and_grad(loss_fn)(params)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            train_loss += loss
+        train_loader = create_data_loader(train_data, batch_size)
+        val_loader = create_data_loader(val_data, batch_size)
         
-        avg_train_loss = train_loss / len(train_loader)
+        total_loss = 0
+        batch_count = 0
+        dropout_rng = jax.random.fold_in(rng, epoch)  # 每个 epoch 独立的 dropout 随机数
         
-        val_loss = 0.0
-        for x, y in val_loader:
-            model.update(params)
-            logits = model(x)
-            val_loss += jnp.mean(optax.softmax_cross_entropy(logits, jax.nn.one_hot(y, 10)))
-        avg_val_loss = val_loss / len(val_loader)
+        for batch in train_loader:
+            batch_dropout_rng = jax.random.fold_in(dropout_rng, batch_count)  # 每个 batch 独立的随机数
+            state, loss = train_step(state, batch, batch_dropout_rng)
+            total_loss += loss
+            batch_count += 1
         
+        avg_loss = total_loss / batch_count
         if (epoch + 1) % print_interval == 0:
-            print(f"Epoch {epoch+1:2d} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            accuracy = evaluate(state, val_loader)
+            print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
     
-    model.update(params)
-    return model
+    return state
